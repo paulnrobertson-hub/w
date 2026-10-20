@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using BepInEx;
 using UnityEngine;
@@ -6,7 +7,7 @@ using UnityEngine;
 namespace WalkSimPlus
 {
     // credit waffle
-    [BepInPlugin("waffle.walksimplus", "WalkSim+", "1.2.0")]
+    [BepInPlugin("waffle.walksimplus", "WalkSim+", "1.3.0")]
     public class Plugin : BaseUnityPlugin
     {
         // Keyboard controls:
@@ -48,6 +49,8 @@ namespace WalkSimPlus
         Transform headTf;
         string toast = "";
         float toastUntil;
+        bool warnedPlayer;
+        bool heartbeatLogged;
 
         // saved state so we can restore things when toggled off
         bool savedGravity;
@@ -59,6 +62,11 @@ namespace WalkSimPlus
         bool[] savedColliderEnabled;
 
         bool Flying { get { return fly || noclip; } }
+
+        void Awake()
+        {
+            Logger.LogInfo("WalkSim+ 1.3.0 awake. Keys: F walk, B fly, N noclip, G speed, L teleport");
+        }
 
         void Start()
         {
@@ -89,6 +97,11 @@ namespace WalkSimPlus
                     return;
                 }
             }
+            if (!warnedPlayer)
+            {
+                warnedPlayer = true;
+                Logger.LogWarning("WalkSim+: could not find the player class (GTPlayer/Player) yet.");
+            }
         }
 
         bool EnsureReady()
@@ -102,6 +115,7 @@ namespace WalkSimPlus
         {
             toast = msg;
             toastUntil = Time.time + 2f;
+            Logger.LogInfo("WalkSim+: " + msg);
         }
 
         // ---------- Noclip ----------
@@ -122,6 +136,10 @@ namespace WalkSimPlus
                         savedLayers = layerField.GetValue(playerInstance);
                         layerField.SetValue(playerInstance, (LayerMask)0);
                         layersSaved = true;
+                    }
+                    else
+                    {
+                        Logger.LogWarning("WalkSim+: field locomotionEnabledLayers not found, noclip may not pass through walls.");
                     }
                 }
                 if (playerColliders == null)
@@ -173,20 +191,28 @@ namespace WalkSimPlus
 
         void Update()
         {
-            if (Input.GetKeyDown(WalkKey))
+            if (!heartbeatLogged && Time.time > 15f)
+            {
+                heartbeatLogged = true;
+                EnsureReady();
+                Logger.LogInfo("WalkSim+ running. Input backend: " + Inp.Describe() + ", player found: " + (playerComp != null) + ", camera found: " + (Camera.main != null));
+            }
+
+            if (Inp.Down(WalkKey))
             {
                 walk = !walk;
                 smoothed = Vector3.zero;
                 Toast("WalkSim " + (walk ? "ON" : "OFF"));
             }
-            if (Input.GetKeyDown(FlyKey))
+            if (Inp.Down(FlyKey))
             {
                 fly = !fly;
                 smoothed = Vector3.zero;
+                EnsureReady();
                 RefreshGravity();
                 Toast("Fly " + (fly ? "ON" : "OFF"));
             }
-            if (Input.GetKeyDown(NoclipKey))
+            if (Inp.Down(NoclipKey))
             {
                 noclip = !noclip;
                 smoothed = Vector3.zero;
@@ -194,12 +220,12 @@ namespace WalkSimPlus
                 RefreshGravity();
                 Toast("Noclip " + (noclip ? "ON" : "OFF"));
             }
-            if (Input.GetKeyDown(SpeedKey))
+            if (Inp.Down(SpeedKey))
             {
                 speedIndex = (speedIndex + 1) % Speeds.Length;
                 Toast("Speed: " + SpeedNames[speedIndex]);
             }
-            if (Input.GetKeyDown(TeleportKey))
+            if (Inp.Down(TeleportKey))
             {
                 TeleportToMouse();
             }
@@ -208,11 +234,11 @@ namespace WalkSimPlus
         // ---------- Teleport ----------
         void TeleportToMouse()
         {
-            if (!EnsureReady()) return;
+            if (!EnsureReady()) { Toast("Teleport: player not ready"); return; }
             var cam = Camera.main;
             if (cam == null) return;
 
-            Ray ray = cam.ScreenPointToRay(Input.mousePosition);
+            Ray ray = cam.ScreenPointToRay(Inp.MousePos());
             var hits = Physics.RaycastAll(ray, teleportMaxDist, ~0, QueryTriggerInteraction.Ignore);
             if (hits.Length == 0)
             {
@@ -284,15 +310,15 @@ namespace WalkSimPlus
             RefreshGravity();
 
             Vector2 stick = Vector2.zero;
-            if (Input.GetKey(KeyCode.W)) stick.y += 1f;
-            if (Input.GetKey(KeyCode.S)) stick.y -= 1f;
-            if (Input.GetKey(KeyCode.D)) stick.x += 1f;
-            if (Input.GetKey(KeyCode.A)) stick.x -= 1f;
+            if (Inp.Held(KeyCode.W)) stick.y += 1f;
+            if (Inp.Held(KeyCode.S)) stick.y -= 1f;
+            if (Inp.Held(KeyCode.D)) stick.x += 1f;
+            if (Inp.Held(KeyCode.A)) stick.x -= 1f;
             if (stick.magnitude > 1f) stick.Normalize();
 
-            bool sprint = Input.GetKey(SprintKey);
-            bool up = Input.GetKey(UpKey);
-            bool down = Input.GetKey(DownKey);
+            bool sprint = Inp.Held(SprintKey);
+            bool up = Inp.Held(UpKey);
+            bool down = Inp.Held(DownKey);
             float speed = Speeds[speedIndex] * (sprint ? sprintMult : 1f);
 
             if (Flying)
@@ -348,6 +374,156 @@ namespace WalkSimPlus
             {
                 GUI.Label(new Rect(20, 20, 400, 30), toast);
             }
+        }
+    }
+
+    // Keyboard/mouse reader. Gorilla Tag may only have Unity's NEW Input System turned on,
+    // in which case UnityEngine.Input throws. So try the new system (by reflection, no extra
+    // reference needed) and fall back to the old one.
+    static class Inp
+    {
+        static bool init, newOk, legacyBroken, mouseOk;
+        static Type keyEnumType;
+        static PropertyInfo kbCurrent, kbItem, mouseCurrent, mousePosProp, pDown, pHeld;
+        static MethodInfo readVec;
+        static string lastBackend = "none";
+        static readonly Dictionary<KeyCode, object> keyCache = new Dictionary<KeyCode, object>();
+
+        public static string Describe()
+        {
+            if (!init) Init();
+            return "newInputSystem=" + newOk + ", legacyBroken=" + legacyBroken + ", lastUsed=" + lastBackend;
+        }
+
+        static void Init()
+        {
+            init = true;
+            try
+            {
+                var kbType = Type.GetType("UnityEngine.InputSystem.Keyboard, Unity.InputSystem");
+                keyEnumType = Type.GetType("UnityEngine.InputSystem.Key, Unity.InputSystem");
+                if (kbType != null && keyEnumType != null)
+                {
+                    kbCurrent = kbType.GetProperty("current", BindingFlags.Public | BindingFlags.Static);
+                    foreach (var p in kbType.GetProperties())
+                    {
+                        if (p.Name != "Item") continue;
+                        var ip = p.GetIndexParameters();
+                        if (ip.Length == 1 && ip[0].ParameterType == keyEnumType) { kbItem = p; break; }
+                    }
+                    newOk = kbCurrent != null && kbItem != null;
+                }
+            }
+            catch { newOk = false; }
+
+            try
+            {
+                var mType = Type.GetType("UnityEngine.InputSystem.Mouse, Unity.InputSystem");
+                if (mType != null)
+                {
+                    mouseCurrent = mType.GetProperty("current", BindingFlags.Public | BindingFlags.Static);
+                    mousePosProp = mType.GetProperty("position", BindingFlags.Public | BindingFlags.Instance);
+                    if (mousePosProp != null)
+                    {
+                        foreach (var m in mousePosProp.PropertyType.GetMethods())
+                        {
+                            if (m.Name == "ReadValue" && m.GetParameters().Length == 0) { readVec = m; break; }
+                        }
+                    }
+                    mouseOk = mouseCurrent != null && mousePosProp != null && readVec != null;
+                }
+            }
+            catch { mouseOk = false; }
+        }
+
+        static object GetControl(KeyCode k)
+        {
+            var kb = kbCurrent.GetValue(null, null);
+            if (kb == null) return null;
+            object key;
+            if (!keyCache.TryGetValue(k, out key))
+            {
+                string name = k == KeyCode.LeftControl ? "LeftCtrl" : k.ToString();
+                key = Enum.Parse(keyEnumType, name);
+                keyCache[k] = key;
+            }
+            return kbItem.GetValue(kb, new object[] { key });
+        }
+
+        public static bool Down(KeyCode k)
+        {
+            if (!init) Init();
+            if (newOk)
+            {
+                try
+                {
+                    var c = GetControl(k);
+                    if (c != null)
+                    {
+                        if (pDown == null) pDown = c.GetType().GetProperty("wasPressedThisFrame");
+                        if (pDown != null)
+                        {
+                            lastBackend = "InputSystem";
+                            if ((bool)pDown.GetValue(c, null)) return true;
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (!legacyBroken)
+            {
+                try { if (Input.GetKeyDown(k)) { lastBackend = "legacy"; return true; } }
+                catch (InvalidOperationException) { legacyBroken = true; }
+            }
+            return false;
+        }
+
+        public static bool Held(KeyCode k)
+        {
+            if (!init) Init();
+            if (newOk)
+            {
+                try
+                {
+                    var c = GetControl(k);
+                    if (c != null)
+                    {
+                        if (pHeld == null) pHeld = c.GetType().GetProperty("isPressed");
+                        if (pHeld != null && (bool)pHeld.GetValue(c, null)) return true;
+                    }
+                }
+                catch { }
+            }
+            if (!legacyBroken)
+            {
+                try { if (Input.GetKey(k)) return true; }
+                catch (InvalidOperationException) { legacyBroken = true; }
+            }
+            return false;
+        }
+
+        public static Vector2 MousePos()
+        {
+            if (!init) Init();
+            if (mouseOk)
+            {
+                try
+                {
+                    var m = mouseCurrent.GetValue(null, null);
+                    if (m != null)
+                    {
+                        var posCtrl = mousePosProp.GetValue(m, null);
+                        return (Vector2)readVec.Invoke(posCtrl, null);
+                    }
+                }
+                catch { }
+            }
+            if (!legacyBroken)
+            {
+                try { return Input.mousePosition; }
+                catch (InvalidOperationException) { legacyBroken = true; }
+            }
+            return new Vector2(Screen.width / 2f, Screen.height / 2f);
         }
     }
 }
