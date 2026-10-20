@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>netstandard2.0</TargetFramework>
+    <AssemblyName>WalkSimPlus</AssemblyName>
+    <LangVersion>latest</LangVersion>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <DebugType>none</DebugType>
+  </PropertyGroup>
+
+  <!-- References come from NuGet, so no Gorilla Tag files are needed to build.
+       The plugin finds the game's player class by reflection at runtime. -->
+  <ItemGroup>
+    <PackageReference Include="BepInEx.Core" Version="5.4.21" IncludeAssets="compile" />
+    <PackageReference Include="UnityEngine.Modules" Version="2021.3.33" IncludeAssets="compile" />
+  </ItemGroup>
+</Project>
