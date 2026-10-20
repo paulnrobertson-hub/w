@@ -7,7 +7,7 @@ using UnityEngine;
 namespace WalkSimPlus
 {
     // credit waffle
-    [BepInPlugin("waffle.walksimplus", "WalkSim+", "1.3.0")]
+    [BepInPlugin("waffle.walksimplus", "WalkSim+", "1.5.0")]
     public class Plugin : BaseUnityPlugin
     {
         // Keyboard controls:
@@ -20,6 +20,9 @@ namespace WalkSimPlus
         //   N             = toggle Noclip on/off (also turns Fly on while active)
         //   G             = cycle speed preset
         //   L             = teleport to where your mouse is pointing
+        //   M             = toggle mouse look (locks the cursor; crosshair = teleport target)
+        //   E (hold)      = grab the surface under the crosshair/mouse and pull yourself to it;
+        //                   let go to release (you keep a little momentum)
         static readonly float[] Speeds = { 3f, 5f, 7.5f, 10f };
         static readonly string[] SpeedNames = { "Slow", "Normal", "Fast", "Turbo" };
 
@@ -28,6 +31,8 @@ namespace WalkSimPlus
         const KeyCode NoclipKey = KeyCode.N;
         const KeyCode SpeedKey = KeyCode.G;
         const KeyCode TeleportKey = KeyCode.L;
+        const KeyCode MouseLookKey = KeyCode.M;
+        const KeyCode GrabKey = KeyCode.E;
         const KeyCode SprintKey = KeyCode.LeftShift;
         const KeyCode UpKey = KeyCode.Space;
         const KeyCode DownKey = KeyCode.LeftControl;
@@ -35,12 +40,20 @@ namespace WalkSimPlus
         bool walk = false;
         bool fly = false;
         bool noclip = false;
+        bool mouseLook = false;
+        float yaw, pitch;
+        float lookSensitivity = 0.12f;   // degrees per mouse pixel; change to taste
         int speedIndex = 1;
         float sprintMult = 1.6f;
         float accel = 14f;
         float jumpPower = 5.5f;
         float groundCheckDist = 0.35f;
         float teleportMaxDist = 500f;
+        float grabReach = 25f;       // how far away a surface can be grabbed
+        float grabPullSpeed = 9f;    // how fast the grab pulls you in
+        float grabHoldDist = 0.9f;   // stop this far from the grabbed point
+        bool grabbing;
+        Vector3 grabPoint;
 
         Vector3 smoothed;
         object playerInstance;
@@ -62,10 +75,48 @@ namespace WalkSimPlus
         bool[] savedColliderEnabled;
 
         bool Flying { get { return fly || noclip; } }
+        bool NoGravity { get { return fly || noclip || grabbing; } }
 
         void Awake()
         {
-            Logger.LogInfo("WalkSim+ 1.3.0 awake. Keys: F walk, B fly, N noclip, G speed, L teleport");
+            Logger.LogInfo("WalkSim+ 1.4.0 awake. Keys: F walk, B fly, N noclip, G speed, L teleport, M mouse look");
+            Application.onBeforeRender += ApplyLook;
+        }
+
+        // ---------- Mouse look ----------
+        void SetMouseLook(bool on)
+        {
+            mouseLook = on;
+            if (on)
+            {
+                var cam = Camera.main;
+                if (cam != null)
+                {
+                    var e = cam.transform.eulerAngles;
+                    yaw = e.y;
+                    pitch = e.x > 180f ? e.x - 360f : e.x;
+                }
+                Cursor.lockState = CursorLockMode.Locked;
+                Cursor.visible = false;
+            }
+            else
+            {
+                Cursor.lockState = CursorLockMode.None;
+                Cursor.visible = true;
+            }
+        }
+
+        void ApplyLook()
+        {
+            if (!mouseLook) return;
+            var cam = Camera.main;
+            if (cam == null) return;
+            cam.transform.rotation = Quaternion.Euler(pitch, yaw, 0f);
+        }
+
+        void LateUpdate()
+        {
+            ApplyLook();
         }
 
         void Start()
@@ -176,13 +227,13 @@ namespace WalkSimPlus
         void RefreshGravity()
         {
             if (rb == null) return;
-            if (Flying && !gravitySaved)
+            if (NoGravity && !gravitySaved)
             {
                 savedGravity = rb.useGravity;
                 gravitySaved = true;
                 rb.useGravity = false;
             }
-            else if (!Flying && gravitySaved)
+            else if (!NoGravity && gravitySaved)
             {
                 rb.useGravity = savedGravity;
                 gravitySaved = false;
@@ -196,6 +247,29 @@ namespace WalkSimPlus
                 heartbeatLogged = true;
                 EnsureReady();
                 Logger.LogInfo("WalkSim+ running. Input backend: " + Inp.Describe() + ", player found: " + (playerComp != null) + ", camera found: " + (Camera.main != null));
+            }
+
+            if (Inp.Down(MouseLookKey))
+            {
+                SetMouseLook(!mouseLook);
+                Toast("Mouse look " + (mouseLook ? "ON" : "OFF"));
+            }
+            if (mouseLook)
+            {
+                Vector2 d = Inp.MouseDelta();
+                yaw += d.x * lookSensitivity;
+                pitch = Mathf.Clamp(pitch - d.y * lookSensitivity, -89f, 89f);
+            }
+
+            if (Inp.Down(GrabKey))
+            {
+                TryGrab();
+            }
+            if (grabbing && !Inp.Held(GrabKey))
+            {
+                grabbing = false;
+                RefreshGravity();
+                Logger.LogInfo("WalkSim+: released grab");
             }
 
             if (Inp.Down(WalkKey))
@@ -229,6 +303,28 @@ namespace WalkSimPlus
             {
                 TeleportToMouse();
             }
+        }
+
+        // ---------- Grab ----------
+        void TryGrab()
+        {
+            if (!EnsureReady()) return;
+            var cam = Camera.main;
+            if (cam == null) return;
+
+            Ray ray = cam.ScreenPointToRay(Inp.MousePos());
+            var hits = Physics.RaycastAll(ray, grabReach, ~0, QueryTriggerInteraction.Ignore);
+            Array.Sort(hits, (a, b) => a.distance.CompareTo(b.distance));
+            foreach (var h in hits)
+            {
+                if (h.collider.transform.IsChildOf(playerComp.transform)) continue;
+                grabPoint = h.point;
+                grabbing = true;
+                RefreshGravity();
+                Logger.LogInfo("WalkSim+: grabbed a surface " + h.distance.ToString("0.0") + "m away");
+                return;
+            }
+            Toast("Grab: nothing in reach");
         }
 
         // ---------- Teleport ----------
@@ -304,6 +400,19 @@ namespace WalkSimPlus
         // ---------- Movement ----------
         void FixedUpdate()
         {
+            if (grabbing)
+            {
+                if (!EnsureReady()) return;
+                RefreshGravity();
+                Vector3 to = grabPoint - headTf.position;
+                float dist = to.magnitude;
+                if (dist <= grabHoldDist)
+                    rb.velocity = Vector3.zero; // hang on to it
+                else
+                    rb.velocity = to.normalized * Mathf.Min(grabPullSpeed, (dist - grabHoldDist) * 6f + 1f);
+                return;
+            }
+
             if (!walk && !Flying) return;
             if (!EnsureReady()) return;
 
@@ -364,6 +473,8 @@ namespace WalkSimPlus
         void OnDestroy()
         {
             // put everything back if the plugin unloads
+            Application.onBeforeRender -= ApplyLook;
+            if (mouseLook) SetMouseLook(false);
             if (noclip) SetNoclip(false);
             if (gravitySaved && rb != null) rb.useGravity = savedGravity;
         }
@@ -373,6 +484,12 @@ namespace WalkSimPlus
             if (Time.time < toastUntil)
             {
                 GUI.Label(new Rect(20, 20, 400, 30), toast);
+            }
+            if (mouseLook)
+            {
+                // small crosshair at screen centre
+                float cx = Screen.width / 2f, cy = Screen.height / 2f;
+                GUI.Label(new Rect(cx - 6, cy - 12, 20, 24), "+");
             }
         }
     }
@@ -500,6 +617,54 @@ namespace WalkSimPlus
                 catch (InvalidOperationException) { legacyBroken = true; }
             }
             return false;
+        }
+
+        static PropertyInfo mouseDeltaProp;
+        static MethodInfo readDelta;
+        static bool deltaInit;
+
+        public static Vector2 MouseDelta()
+        {
+            if (!init) Init();
+            if (!deltaInit)
+            {
+                deltaInit = true;
+                try
+                {
+                    var mType = Type.GetType("UnityEngine.InputSystem.Mouse, Unity.InputSystem");
+                    if (mType != null)
+                    {
+                        mouseDeltaProp = mType.GetProperty("delta", BindingFlags.Public | BindingFlags.Instance);
+                        if (mouseDeltaProp != null)
+                        {
+                            foreach (var m in mouseDeltaProp.PropertyType.GetMethods())
+                            {
+                                if (m.Name == "ReadValue" && m.GetParameters().Length == 0) { readDelta = m; break; }
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            if (mouseOk && mouseDeltaProp != null && readDelta != null)
+            {
+                try
+                {
+                    var m = mouseCurrent.GetValue(null, null);
+                    if (m != null)
+                    {
+                        var ctrl = mouseDeltaProp.GetValue(m, null);
+                        return (Vector2)readDelta.Invoke(ctrl, null);
+                    }
+                }
+                catch { }
+            }
+            if (!legacyBroken)
+            {
+                try { return new Vector2(Input.GetAxisRaw("Mouse X"), Input.GetAxisRaw("Mouse Y")) * 8f; }
+                catch (Exception) { legacyBroken = true; }
+            }
+            return Vector2.zero;
         }
 
         public static Vector2 MousePos()
